@@ -1,0 +1,52 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pfdenoise"
+version = "0.1.0"
+description = "Physics-prior point-cloud/mesh denoising benchmark: noise models as first-class objects, phase-field solvers, and a label-free evaluation protocol."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "pfdenoise contributors" }]
+keywords = [
+    "denoising", "point-cloud", "mesh", "phase-field", "allen-cahn",
+    "cahn-hilliard", "noise2noise", "benchmark", "geometry-processing",
+    "computational-geometry", "inverse-problem",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+dependencies = ["numpy>=1.22"]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.5"]
+dev = ["pytest>=7", "ruff>=0.4"]
+
+[project.urls]
+Homepage = "https://github.com/your-org/pfdenoise"
+Repository = "https://github.com/your-org/pfdenoise"
+Issues = "https://github.com/your-org/pfdenoise/issues"
+
+[project.scripts]
+pfdenoise = "pfdenoise.cli:main"
+
+[tool.setuptools]
+packages = ["pfdenoise"]
+
+[tool.ruff]
+line-length = 96
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E741"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

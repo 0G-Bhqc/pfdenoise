@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# 跑出来的结果与图
+results.csv
+ac_2d_frames/
+ac_3d_out/
+samples/
+*.png
+!docs/**/*.png
+
+# 编辑器
+.vscode/
+.idea/
+.DS_Store

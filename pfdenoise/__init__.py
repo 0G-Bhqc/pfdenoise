@@ -60,3 +60,6 @@ __all__ = [
     "metrics", "solvers", "noise", "shapes", "mesh_io",
 ]
 
+# Auto-exposed submodules by PackageIntegrityChecker
+from . import benchmark
+from . import cli

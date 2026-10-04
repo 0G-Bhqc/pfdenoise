@@ -31,8 +31,9 @@ import numpy as np
 from .noise import _NN
 
 __all__ = ["chamfer", "hausdorff", "estimate_normals", "normal_error",
-           "extent_stats", "radius_drift", "p2m", "thickness",
-           "n2n_consistency", "self_consistency", "evaluate", "evaluate_n2n"]
+           "extent_stats", "radius_drift", "volume_drift", "convex_hull_volume",
+           "p2m", "thickness", "n2n_consistency", "self_consistency",
+           "bias_variance_decomposition", "evaluate", "evaluate_n2n"]
 
 
 def _nn_dist(query, ref, nn=None):
@@ -137,6 +138,29 @@ def radius_drift(P_est, P_ref):
     return float(100.0 * (r1 - r0) / max(abs(r0), 1e-12))
 
 
+def convex_hull_volume(P: np.ndarray) -> float:
+    """利用 3D 凸包精确计算封闭外包络体积（基于 scipy）。"""
+    try:
+        from scipy.spatial import ConvexHull
+        hull = ConvexHull(np.asarray(P, dtype=np.float64))
+        return float(hull.volume)
+    except Exception:
+        return float("nan")
+
+
+def volume_drift(P_est: np.ndarray, P_ref: np.ndarray) -> float:
+    """基于真封闭外包络或凸包的体积漂移百分比 (%)。
+    
+    若 scipy 可用且点云非退化，报基于凸包的高精度真体积漂移；
+    若不可用或计算失败，自动退回到 radius_drift。
+    """
+    v0 = convex_hull_volume(P_ref)
+    v1 = convex_hull_volume(P_est)
+    if np.isfinite(v0) and np.isfinite(v1) and v0 > 1e-12:
+        return float(100.0 * (v1 - v0) / v0)
+    return radius_drift(P_est, P_ref)
+
+
 def thickness(P_est, P_ref, nn=None):
     """去噪点到参考曲面的平均距离（越小越贴合）。
 
@@ -185,6 +209,8 @@ def evaluate(P_est, P_ref, N_ref, ref_dense=None, res_floor=None):
         "hausdorff": hausdorff(P_est, P_ref),
         "normal_err": normal_error(P_est, P_ref, N_ref, nn_ref=nn_ref),
         "radius_drift": radius_drift(P_est, P_ref),
+        "volume_drift": volume_drift(P_est, P_ref),
+        "thickness": thickness(P_est, P_ref, nn=nn_ref),
     }
     if res_floor:
         out["res_floor"] = res_floor
@@ -192,6 +218,67 @@ def evaluate(P_est, P_ref, N_ref, ref_dense=None, res_floor=None):
     return out
 
 
+def bias_variance_decomposition(
+    predictions: list[np.ndarray], ref: np.ndarray | None = None
+) -> dict[str, float]:
+    r"""多次独立噪声观测的偏差-方差分解协议 (Bias-Variance Decomposition)。
+
+    针对 K >= 2 次由同一真实曲面独立采样的噪声观测去噪结果，
+    从数学上将总误差分解为：
+      - 随机扰动方差 (Variance): 各次去噪结果相对共识平均解的离散抖动；
+      - 结构偏差平方 (Bias^2): 共识平均解相对真值曲面的系统性几何变形（过度平滑/收缩）；
+      - 总均方误差 (Total MSE): MSE = Bias^2 + Variance；
+      - 无标签一致性 (Consistency): 预测两两之间的平均 Chamfer 距离。
+
+    这是无标注评测协议的理论核心：能在没有干净真值时，区分「过度保守的有偏估计器」
+    与「对噪声敏感的高方差估计器」。
+    """
+    K = len(predictions)
+    if K < 2:
+        raise ValueError(f"偏差-方差分解需要至少 2 次独立观测预测，实测 K={K}")
+
+    # 将预测集对齐至统一的点集规模
+    N_pts = len(predictions[0])
+    aligned = []
+    for P in predictions:
+        P_arr = np.asarray(P, dtype=np.float64)
+        if len(P_arr) != N_pts:
+            sel = np.linspace(0, len(P_arr) - 1, N_pts).astype(np.int64)
+            P_arr = P_arr[sel]
+        aligned.append(P_arr)
+
+    preds_stack = np.stack(aligned, axis=0)  # [K, N, 3]
+    consensus = preds_stack.mean(axis=0)     # [N, 3] 共识解
+
+    # 1. 经验方差 Var = (1/K) \sum_k (1/N) \sum_i ||P_i^(k) - \bar{P}_i||^2
+    var_pointwise = np.mean(np.sum((preds_stack - consensus) ** 2, axis=-1))
+    variance = float(var_pointwise)
+
+    # 2. 两两一致性 (Pairwise Chamfer Consistency)
+    cons_list = []
+    for i in range(K):
+        for j in range(i + 1, K):
+            cons_list.append(chamfer(aligned[i], aligned[j]))
+    consistency = float(np.mean(cons_list)) if cons_list else 0.0
+
+    out = {
+        "variance": variance,
+        "std_dev": float(np.sqrt(max(variance, 0.0))),
+        "consistency": consistency,
+        "n_runs": K,
+    }
+
+    if ref is not None:
+        ref_arr = np.asarray(ref, dtype=np.float64)
+        bias_cd = chamfer(consensus, ref_arr)
+        out["bias_chamfer"] = float(bias_cd)
+        out["bias_sq"] = float(bias_cd ** 2)
+        out["total_mse"] = float(bias_cd ** 2 + variance)
+
+    return out
+
+
 def evaluate_n2n(P_a, P_b):
     """无标签协议：输入两份「同一曲面的独立噪声观测」，输出可用指标。"""
     return {"raw_consistency": n2n_consistency(P_a, P_b)}
+

@@ -36,9 +36,14 @@ for _s in (_sys.stdout, _sys.stderr):
 from .shapes import make_shape, SHAPES
 from .noise import (NoiseModel, Gaussian, Protrusion, Outlier, Aniso, Density,
                     Composite, NOISE_MODELS, make_noise)
-from .solvers import SOLVERS, DESCRIPTIONS, get_solver
-from . import metrics, solvers, noise, shapes
-from .benchmark import run_benchmark, run_n2n, make_table, DEFAULT_SOLVERS
+from .solvers import (SOLVERS, DESCRIPTIONS, get_solver,
+                    phase_field_ac_conserved, phase_field_ac_anisotropic,
+                    phase_field_ac_convex, phase_field_ac_convex_adaptive)
+from . import metrics, solvers, noise, shapes, mesh_io
+from .benchmark import (run_benchmark, run_n2n, run_bias_variance,
+                        make_table, make_bv_table, DEFAULT_SOLVERS)
+from .mesh_io import (load_point_cloud, save_point_cloud, normalize_cloud, denoise_file,
+                      load_ply, save_ply, load_obj, save_obj, load_mat_volume)
 
 __all__ = [
     "__version__",
@@ -46,6 +51,12 @@ __all__ = [
     "NoiseModel", "Gaussian", "Protrusion", "Outlier", "Aniso", "Density",
     "Composite", "NOISE_MODELS", "make_noise",
     "SOLVERS", "DESCRIPTIONS", "get_solver",
-    "run_benchmark", "run_n2n", "make_table", "DEFAULT_SOLVERS",
-    "metrics", "solvers", "noise", "shapes",
+    "phase_field_ac_conserved", "phase_field_ac_anisotropic",
+    "phase_field_ac_convex", "phase_field_ac_convex_adaptive",
+    "run_benchmark", "run_n2n", "run_bias_variance", "make_table", "make_bv_table",
+    "DEFAULT_SOLVERS",
+    "load_point_cloud", "save_point_cloud", "normalize_cloud", "denoise_file",
+    "load_ply", "save_ply", "load_obj", "save_obj", "load_mat_volume",
+    "metrics", "solvers", "noise", "shapes", "mesh_io",
 ]
+

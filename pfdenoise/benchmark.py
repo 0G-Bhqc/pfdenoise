@@ -18,16 +18,22 @@ from . import solvers as S
 from .noise import _NN, make_noise
 from .shapes import make_shape
 
-__all__ = ["run_benchmark", "run_n2n", "make_table", "DEFAULT_SOLVERS"]
+__all__ = ["run_benchmark", "run_n2n", "run_bias_variance", "make_table",
+           "make_bv_table", "DEFAULT_SOLVERS"]
 
-DEFAULT_SOLVERS = ["none", "laplacian", "bilateral",
-                   "pf_ac", "pf_ac_fidelity", "pf_ac_barrier", "cahn_hilliard"]
+DEFAULT_SOLVERS = [
+    "none", "laplacian", "bilateral",
+    "pf_ac", "pf_ac_fidelity", "pf_ac_barrier",
+    "pf_ac_conserved", "pf_ac_aniso", "pf_ac_convex", "pf_ac_convex_adaptive",
+    "cahn_hilliard"
+]
 
 # 越小越好的指标
 LOWER_BETTER = {"chamfer", "p2m", "p2m_p95", "hausdorff",
-                "normal_err", "radius_drift", "raw_consistency"}
+                "normal_err", "radius_drift", "volume_drift", "thickness",
+                "raw_consistency", "variance", "total_mse"}
 # 相对真值的绝对值，漂移类指标要看 |·|
-ABS_METRICS = {"radius_drift"}
+ABS_METRICS = {"radius_drift", "volume_drift"}
 
 
 def _obs(P_ref, N_ref, noise, seed, shape, shape_seed, dense_mult=4):
@@ -146,11 +152,80 @@ def run_n2n(shape="bumpy", n=6000, noise="gaussian", seed=0,
     return rows
 
 
+def run_bias_variance(shape="bumpy", n=3000, noise="realistic", k_runs=3,
+                       seed=0, solver_names=None, solver_kwargs=None,
+                       verbose=True):
+    r"""偏差-方差分解协议：在 K 次独立噪声观测下量化算法的方差与结构偏差。
+
+    这是本包在无标签与小样本评测上的重大理论与方法学落地：
+      - 方差 (Variance / Instability): 算法对同分布噪声波动的随机扰动敏感性；
+      - 偏差 (Bias / Structural Distortion): 共识解相对于真值曲面的系统性萎缩与钝化；
+      - 总 MSE = Bias^2 + Variance。
+    """
+    solver_names = solver_names or DEFAULT_SOLVERS
+    solver_kwargs = solver_kwargs or {}
+
+    P_ref, N_ref, _, scale = make_shape(shape, n, seed)
+    nm = make_noise(noise)
+    nn = _NN(P_ref)
+
+    # 产生 K 份独立的噪声观测
+    noisy_obs = []
+    for i in range(k_runs):
+        rng = np.random.default_rng(seed + 101 + i * 17)
+        Pn = nm.apply(P_ref, N_ref, rng, nn)
+        noisy_obs.append(Pn)
+
+    if verbose:
+        print(f"偏差-方差评测协议  曲面={shape}  n={n}  噪声={noise}  独立观测数 K={k_runs}")
+        print(f"  噪声假设: {nm.assumption_text()}")
+        print(f"  N2N 理论适用: {'是' if nm.n2n_compatible else '否'}\n")
+
+    bv_rows = []
+    for name in solver_names:
+        fn = S.get_solver(name)
+        kw = solver_kwargs.get(name, {})
+        preds = []
+        failed = False
+        t0 = time.perf_counter()
+        for idx_run, Pn in enumerate(noisy_obs):
+            try:
+                out = fn(Pn, N_ref, **kw)
+                P_est = out[0] if isinstance(out, tuple) else out
+                preds.append(P_est)
+            except Exception as e:
+                failed = True
+                bv_rows.append(dict(solver=name, error=f"{type(e).__name__}: {e}"))
+                if verbose:
+                    print(f"  {name:<22} 观测 #{idx_run+1} 失败：{e}")
+                break
+        if failed:
+            continue
+        dt_s = (time.perf_counter() - t0) / k_runs
+        decomp = M.bias_variance_decomposition(preds, ref=P_ref)
+        row = {
+            "solver": name,
+            "variance": decomp["variance"],
+            "std_dev": decomp["std_dev"],
+            "consistency": decomp["consistency"],
+            "bias_cd": decomp.get("bias_chamfer", float("nan")),
+            "bias_sq": decomp.get("bias_sq", float("nan")),
+            "total_mse": decomp.get("total_mse", float("nan")),
+            "sec_per_run": dt_s,
+        }
+        bv_rows.append(row)
+        if verbose:
+            print(f"  {name:<22} Var={row['variance']:.6f}  Consist={row['consistency']:.4f}  "
+                  f"BiasCD={row['bias_cd']:.4f}  TotalMSE={row['total_mse']:.6f}  ({dt_s:.2f}s/run)")
+    return bv_rows
+
+
 COLUMNS = [("solver", "solver", "str"), ("chamfer", "CD↓", "num"),
            ("p2m", "P2M↓", "num"), ("p2m_p95", "P2M95↓", "num"),
            ("hausdorff", "HD↓", "num"), ("normal_err", "nErr↓°", "num"),
-           ("radius_drift", "rDrift%", "num"), ("at_floor", "触底", "flag"),
-           ("seconds", "sec", "num")]
+           ("radius_drift", "rDrift%", "num"), ("volume_drift", "vDrift%", "num"),
+           ("thickness", "thick↓", "num"),
+           ("at_floor", "触底", "flag"), ("seconds", "sec", "num")]
 
 
 def make_table(rows, fmt="markdown", title=None):
@@ -182,3 +257,44 @@ def make_table(rows, fmt="markdown", title=None):
                 cells.append(str(v))
         out.append("| " + " | ".join(cells) + " |")
     return "\n".join(out)
+
+
+BV_COLUMNS = [
+    ("solver", "solver", "str"),
+    ("variance", "Var↓", "num_sci"),
+    ("consistency", "Consist↓", "num"),
+    ("bias_cd", "Bias(CD)↓", "num"),
+    ("total_mse", "TotalMSE↓", "num_sci"),
+    ("sec_per_run", "sec/run", "num"),
+]
+
+
+def make_bv_table(rows, fmt="markdown", title=None):
+    """把偏差-方差分解结果格式化为 markdown 或 csv 表格。"""
+    cols = [c for c in BV_COLUMNS if any(c[0] in r for r in rows)]
+    if fmt == "csv":
+        buf = io.StringIO()
+        w = csv.writer(buf)
+        w.writerow([c[1] for c in cols])
+        for r in rows:
+            w.writerow([r.get(c[0], "") for c in cols])
+        return buf.getvalue()
+
+    out = []
+    if title:
+        out.append(f"**{title}**\n")
+    out.append("| " + " | ".join(c[1] for c in cols) + " |")
+    out.append("|" + "|".join(["---"] * len(cols)) + "|")
+    for r in rows:
+        cells = []
+        for key, label, kind in cols:
+            v = r.get(key, "")
+            if kind == "num" and v != "":
+                cells.append(f"{v:.4f}")
+            elif kind == "num_sci" and v != "":
+                cells.append(f"{v:.2e}" if (abs(v) < 1e-3 or abs(v) > 1e3) else f"{v:.6f}")
+            else:
+                cells.append(str(v))
+        out.append("| " + " | ".join(cells) + " |")
+    return "\n".join(out)
+

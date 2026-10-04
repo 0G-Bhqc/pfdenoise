@@ -127,7 +127,9 @@ class Gaussian(NoiseModel):
     def assumption_text(self):
         return f"零均值、各向同性、逐点独立；sigma={self.sigma:.4f}（相对 bbox 半宽）"
 
-    def apply(self, P, N, rng, nn=None):
+    def apply(self, P, N, rng=None, nn=None):
+        if rng is None:
+            rng = np.random.default_rng()
         return P + rng.normal(0.0, self.sigma, P.shape)
 
 
@@ -150,7 +152,9 @@ class Protrusion(NoiseModel):
         return (f"有偏（沿法向系统外推），逐点独立；"
                 f"density={self.density:.3f}, magnitude={self.magnitude:.4f} -> N2N 理论不适用")
 
-    def apply(self, P, N, rng, nn=None):
+    def apply(self, P, N, rng=None, nn=None):
+        if rng is None:
+            rng = np.random.default_rng()
         P = P.copy()
         m = rng.random(len(P)) < self.density
         k = int(m.sum())
@@ -177,7 +181,9 @@ class Outlier(NoiseModel):
         return (f"重尾、密度不均、强有偏；rate={self.rate:.3f}, "
                 f"scale={self.scale:.3f} -> N2N 理论不适用")
 
-    def apply(self, P, N, rng, nn=None):
+    def apply(self, P, N, rng=None, nn=None):
+        if rng is None:
+            rng = np.random.default_rng()
         P = P.copy()
         m = rng.random(len(P)) < self.rate
         k = int(m.sum())
@@ -204,7 +210,9 @@ class Aniso(NoiseModel):
         return (f"零均值但空间相关（低频偏移）；sigma_t={self.sigma_t:.4f}, "
                 f"sigma_n={self.sigma_n:.4f} -> N2N 理论不适用")
 
-    def apply(self, P, N, rng, nn=None):
+    def apply(self, P, N, rng=None, nn=None):
+        if rng is None:
+            rng = np.random.default_rng()
         P = P.copy()
         nt = np.cross(N, rng.normal(size=N.shape))
         nt = _unit(nt)
@@ -236,7 +244,9 @@ class Density(NoiseModel):
         return (f"点数量变化（非一一对应）；ratio=+/-{self.ratio:.2f} -> "
                 f"Chamfer 可用，点级 N2N 配对不可用")
 
-    def apply(self, P, N, rng, nn=None):
+    def apply(self, P, N, rng=None, nn=None):
+        if rng is None:
+            rng = np.random.default_rng()
         n_out = int(len(P) * self.ratio)
         drop = rng.choice(len(P), n_out, replace=False)
         keep = np.setdiff1d(np.arange(len(P)), drop)
@@ -254,7 +264,9 @@ class Composite(NoiseModel):
     def assumption_text(self):
         return " ; ".join(m.assumption_text() for m in self.models)
 
-    def apply(self, P, N, rng, nn=None):
+    def apply(self, P, N, rng=None, nn=None):
+        if rng is None:
+            rng = np.random.default_rng()
         for m in self.models:
             P = m.apply(P, N, rng, nn)
         return P

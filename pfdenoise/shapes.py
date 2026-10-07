@@ -24,17 +24,20 @@ def _sample_sphere(rng, n, R=1.0):
 
 
 def _sample_torus(rng, n, R=1.0, r=0.38):
-    # 面积元 dA = R(R + r cos v) dv du
+    # 面积元 dA = R(R + r cos v) dv du —— v 的边缘密度 ∝ (R + r·cos v)，拒绝采样。
+    # ⚠ 只对**未接受**的点重采样。早先实现每轮对全部 n 个点重抽 v/w、再要求
+    #   keep.all() 才退出 —— 单轮全接受概率 ≈ 0.725^n，n>100 时概率上永不终止
+    #   （make_shape("torus") 直接挂死；此前测试只覆盖 sphere/bumpy，从未暴露）。
     u = rng.uniform(0, 2 * np.pi, n)
-    while True:
-        v = rng.uniform(0, 2 * np.pi, n)
-        w = rng.uniform(0, 1, n)
-        keep = w <= (R + r * np.cos(v)) / (R + r)
-        u[~keep], v[~keep], w[~keep] = (rng.uniform(0, 2 * np.pi, int((~keep).sum())),
-                                         rng.uniform(0, 2 * np.pi, int((~keep).sum())),
-                                         rng.uniform(0, 1, int((~keep).sum())))
-        if keep.all():
-            break
+    v = np.empty(n)
+    pending = np.arange(n)
+    while len(pending):
+        v_new = rng.uniform(0, 2 * np.pi, len(pending))
+        w = rng.uniform(0.0, 1.0, len(pending))
+        ok = w <= (R + r * np.cos(v_new)) / (R + r)
+        acc = pending[ok]
+        v[acc] = v_new[ok]
+        pending = pending[~ok]
     P = np.stack([(R + r * np.cos(v)) * np.cos(u),
                   (R + r * np.cos(v)) * np.sin(u),
                   r * np.sin(v)], axis=1)
@@ -43,22 +46,33 @@ def _sample_torus(rng, n, R=1.0, r=0.38):
 
 
 def _sample_superquadric(rng, n, a=1.0, b=0.8, c=0.7, e1=0.6, e2=0.6):
-    # |x/a|^e1 + |y/b|^e2 + |z/c|^e2 = 1 的椭球型超二次曲面（可调「方-ness」，
-    # 用来测试求解器在平坦大面 + 锐利棱边处的行为）
+    # |x/a|^e1v + |y/b|^e2v + |z/c|^e2v = 1 的椭球型超二次曲面（可调「方-ness」，
+    # 用来测试求解器在平坦大面 + 锐利棱边处的行为）。
+    # ⚠ 拒绝采样同样只对未接受的点重跑（理由同 _sample_torus 的死循环修复）。
     e1v, e2v = 2.0 / e1, 2.0 / e2
-    while True:
-        P = rng.uniform(-1, 1, (n, 3)) * np.array([a, b, c])
-        v = (np.abs(P[:, 0] / a) ** e1v + np.abs(P[:, 1] / b) ** e2v
-             + np.abs(P[:, 2] / c) ** e2v)
-        keep = v <= 1.0
-        if keep.all():
-            break
-        P[~keep] = rng.uniform(-1, 1, ((~keep).sum(), 3)) * np.array([a, b, c])
-    f = lambda P: (np.abs(P[:, 0] / a) ** (e1v - 1) / a
-                   + np.abs(P[:, 1] / b) ** (e2v - 1) / b
-                   + np.abs(P[:, 2] / c) ** (e2v - 1) / c)
-    Nv = f(P)
-    Nv /= np.linalg.norm(Nv, axis=1, keepdims=True)
+    scale = np.array([a, b, c])
+    P = np.empty((n, 3))
+    pending = np.arange(n)
+    while len(pending):
+        cand = rng.uniform(-1, 1, (len(pending), 3)) * scale
+        val = (np.abs(cand[:, 0] / a) ** e1v + np.abs(cand[:, 1] / b) ** e2v
+               + np.abs(cand[:, 2] / c) ** e2v)
+        ok = val <= 1.0
+        acc = pending[ok]
+        P[acc] = cand[ok]
+        pending = pending[~ok]
+    # 解析梯度：F = |x/a|^e1v + |y/b|^e2v + |z/c|^e2v，∂F/∂x = e1v·sign(x)·|x/a|^(e1v-1)/a。
+    # ⚠ sign(x) 不能丢：早先版本用 np.abs(...)** (e-1) 求梯度，负象限的法向
+    # 全部镜像指错方向（|·| 把符号抹掉了）。e1v/e2v 的逐轴系数也必须带上，
+    # 否则即使方向「不出错」、权重也是错的。
+    X, Y, Z = P[:, 0], P[:, 1], P[:, 2]
+    Nv = np.stack([
+        e1v * np.sign(X) * np.abs(X / a) ** (e1v - 1) / a,
+        e2v * np.sign(Y) * np.abs(Y / b) ** (e2v - 1) / b,
+        e2v * np.sign(Z) * np.abs(Z / c) ** (e2v - 1) / c,
+    ], axis=1)
+    nrm = np.linalg.norm(Nv, axis=1, keepdims=True)
+    Nv = Nv / np.maximum(nrm, 1e-12)          # 尖棱处梯度可能退化，防除零
     return P, Nv, lambda: float("nan")     # 超二次曲面无解析体积
 
 

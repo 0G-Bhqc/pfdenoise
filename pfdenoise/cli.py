@@ -66,6 +66,8 @@ def cmd_noise(args):
 
 
 def cmd_bv(args):
+    if args.k < 2:
+        raise SystemExit("bv 协议需要至少 K=2 次独立观测（偏差-方差分解的数学前提）")
     rows = run_bias_variance(shape=args.shape, n=args.n, noise=args.noise,
                              k_runs=args.k, seed=args.seed,
                              solver_names=args.solvers,

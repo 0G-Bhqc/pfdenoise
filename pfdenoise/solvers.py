@@ -34,15 +34,19 @@ __all__ = ["SOLVERS", "get_solver", "identity", "laplacian", "bilateral",
            "phase_field_ac", "phase_field_ac_fidelity", "phase_field_ac_barrier",
            "phase_field_ac_conserved", "phase_field_ac_anisotropic",
            "phase_field_ac_convex", "phase_field_ac_convex_adaptive",
-           "cahn_hilliard"]
+           "cahn_hilliard", "_run_ch"]
 
 
 # --------------------------------------------------------------------------
 # 通用工具
 # --------------------------------------------------------------------------
 def _voxelize(P, n_vox, lo, hi):
-    """把点云体素化成 0/1 占据场。返回 (occ, h)。"""
-    h = float(np.mean(hi - lo) / n_vox)
+    """把点云体素化成 0/1 占据场。返回 (occ, h)。
+
+    h 取**最长轴** / n_vox：若用平均轴长，比平均长的轴上 (P-lo)/h 会越界，
+    被 clip 压进最后一层体素 —— torus 这类扁平包围盒的几何会被整体压扁。
+    """
+    h = float(np.max(hi - lo) / n_vox)
     idx = np.clip(np.floor((P - lo) / h).astype(np.int64), 0, n_vox - 1)
     occ = np.zeros((n_vox, n_vox, n_vox), dtype=bool)
     occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
@@ -116,15 +120,28 @@ def _extract_surface(phi, h, lo, P, N, min_frac=0.05):
     if s > 0:
         cc = np.indices(w.shape).reshape(3, -1)
         cen_idx = (w.reshape(-1) @ cc.T) / s                 # 索引坐标下的重心
-        mean_idx = (pts.mean(0) - lo.mean(0)) / h - 0.5      # 体素中心集合的索引重心
+        # ⚠ 必须逐轴用 lo（(3,) 向量），不能 lo.mean(0)！早先 D-REP-003 修复
+        # 时写成了标量均值——立方包围盒下两者近似相等（sphere/bumpy 无症状），
+        # 但 torus 的 lo=(−1.40,−1.40,−0.41)，z 轴偏差 0.66 个世界单位，
+        # 整个重建被平移出曲面（CD 涨到分辨率下限的 10 倍）。
+        mean_idx = (pts.mean(0) - lo) / h - 0.5              # 体素中心集合的索引重心
         pts = pts + (cen_idx - mean_idx) * h
     target = len(P)
     if len(pts) > target:
-        sel = np.linspace(0, len(pts) - 1, target).astype(np.int64)
+        # 均匀随机下采样。早先用 np.linspace 沿 argwhere 的**扫描序**抽样，
+        # 保留点带系统性的空间格局偏差（argwhere 按行主序输出，linspace
+        # 等价于偏向低 x 区域的扫描带）；随机抽样无此偏置。
+        rng = np.random.default_rng(0)
+        sel = np.sort(rng.choice(len(pts), target, replace=False))
         pts = pts[sel]
     elif len(pts) < target:
+        # 正相体素略少于目标点数时的补齐：在**已有正相点**附近做亚格点抖动。
+        # 早先版本在质心处撒 σ=1e-3 的高斯团——那是在凭空捏造几何，
+        # 会污染 CD/P2M 且无法归因；贴着真实正相点抖动至少不改变整体形状。
+        need = target - len(pts)
         rng = np.random.default_rng(0)
-        extra = rng.normal(0, 1e-3, (target - len(pts), 3)) + pts.mean(0)
+        pick = rng.integers(0, len(pts), need)
+        extra = pts[pick] + rng.normal(0.0, 0.25 * h, (need, 3))
         pts = np.vstack([pts, extra])
     return pts
 
@@ -141,11 +158,14 @@ def laplacian(P, N, iters=10, lam=0.5, **kw):
 
     注意必须取**排除自身**的最近邻：直接查 k=1 会永远查到自己，
     更新量恒为 0，算法看起来在跑但什么都不发生。
+
+    每轮重建索引：点在移动，冻结初始索引会让邻居列表逐渐过期
+    （迭代多 / λ 大时平滑的是「旧邻居关系」，几何失真）。
+    索引构建在 _NN 向量化后是 O(N log N)，这点开销值得花。
     """
-    nn = _NN(P)
     out = P.copy()
     for _ in range(iters):
-        _, idx = nn.query(out, 2)
+        _, idx = _NN(out).query(out, 2)
         out = out + lam * (out[idx[:, 1]] - out)
     return out
 
@@ -154,6 +174,10 @@ def bilateral(P, N, iters=8, sigma_s=0.02, sigma_n=0.3, nn=None,
               max_points=8000, **kw):
     """迭代双边滤波：空间距离 + 法向夹角双权重，保特征。
 
+    ⚠ 已知局限（如实声明，不再伪装成自适应）：邻域固定为 ±1 格
+      （格宽 = 1.5·sigma_s，即约 3σ 的空间窗口）。早先版本每轮计算一个
+      「增长半径」r 传给 _bilateral_once，但函数体内除了 padding 根本没
+      用它 —— 死参数，看起来像自适应半径，实际恒为 1 格。
     ⚠ 性能：_bilateral_once 是 Python 逐点循环，复杂度约 O(n·27)。
       实测 6000 点约 3 s，20000 点要几分钟。所以超过 max_points 时直接报错
       而不是让人干等——想跑大点云请改用矢量化的相场求解器。
@@ -163,13 +187,10 @@ def bilateral(P, N, iters=8, sigma_s=0.02, sigma_n=0.3, nn=None,
             f"bilateral 是 Python 逐点循环，{len(P)} 点会非常慢"
             f"（上限 {max_points}）。要么减小点数，要么改用 pf_* 相场求解器。")
     nn = nn or _NN(P)
-    P0, N0 = P.copy(), N.copy()
     out = P.copy()
     curN = N.copy()
-    for t in range(iters):
-        r = max(2, int(round((2 + 3.5 * t) * sigma_s
-                             / max(np.abs(P0).max(), 1e-9) * len(P) ** (1 / 3))))
-        out = _bilateral_once(out, curN, r, sigma_s, sigma_n)
+    for _ in range(iters):
+        out = _bilateral_once(out, curN, 1, sigma_s, sigma_n)
         _, idx = nn.query(out, 2)          # 排除自身
         curN = out - out[idx[:, 1]]         # 更新法向（邻域切向）
         nrm = np.linalg.norm(curN, axis=1, keepdims=True)
@@ -178,7 +199,10 @@ def bilateral(P, N, iters=8, sigma_s=0.02, sigma_n=0.3, nn=None,
 
 
 def _bilateral_once(P, N, r, sigma_s, sigma_n):
-    """用网格哈希做各向异性加权邻域平均（只取 |Δ| 沿法向小且空间近的点）。"""
+    """用网格哈希做各向异性加权邻域平均（只取 |Δ| 沿法向小且空间近的点）。
+
+    r 是邻域半宽（单位：格）。r=1 时扫 3×3×3 邻域。
+    """
     cell = max(sigma_s * 1.5, 1e-9)
     lo = P.min(0) - r * cell
     key = np.floor((P - lo) / cell).astype(np.int64)
@@ -186,7 +210,8 @@ def _bilateral_once(P, N, r, sigma_s, sigma_n):
     buckets = defaultdict(list)
     for i, k in enumerate(map(tuple, key)):
         buckets[k].append(i)
-    offs = list(np.ndindex(3, 3, 3))
+    span = range(-r, r + 1)
+    offs = [(ox, oy, oz) for ox in span for oy in span for oz in span]
     out = np.empty_like(P)
     wsum = np.empty(len(P))
     for i in range(len(P)):
@@ -194,7 +219,7 @@ def _bilateral_once(P, N, r, sigma_s, sigma_n):
         acc = np.zeros(3)
         wsum[i] = 0.0
         for ox, oy, oz in offs:
-            b = buckets.get((kx + ox - 1, ky + oy - 1, kz + oz - 1))
+            b = buckets.get((kx + ox, ky + oy, kz + oz))
             if not b:
                 continue
             b = np.asarray(b)
@@ -290,12 +315,13 @@ def auto_resolution(P, nn_mult=2.2, n_vox_max=96, verbose=False):
     sp = max(sp, 1e-12)
     h = nn_mult * sp
     ext = P.max(0) - P.min(0)
-    n_vox = int(np.ceil(np.mean(ext) / h))
+    # 与 _voxelize 保持一致：按最长轴换算格数（否则两处 h 语义不一致）
+    n_vox = int(np.ceil(np.max(ext) / h))
     if n_vox > n_vox_max:
         if verbose:
             print(f"  自动分辨率需要 n_vox={n_vox}，截到上限 {n_vox_max}")
         n_vox = n_vox_max
-    h = float(np.mean(ext) / n_vox)
+    h = float(np.max(ext) / n_vox)
     if verbose:
         print(f"  点间距≈{sp:.5f} -> n_vox={n_vox}, h={h:.5f}, "
               f"间距/h={sp/h:.2f}, 体素量化下限≈{h/2:.5f}")
@@ -305,9 +331,25 @@ def auto_resolution(P, nn_mult=2.2, n_vox_max=96, verbose=False):
 def _prep(P, grow=1, smooth=0.5, w=0.4, nn_mult=2.2, n_vox=None,
           n_vox_max=96, verbose=False):
     """相场求解器公共准备：自动定分辨率 -> 体素化 -> 构造可分辨的目标场 T。"""
+    # fail loud：退化输入在下游只会产生「静默垃圾或难懂的除零」，
+    # 在入口一次说清。
+    if not np.isfinite(P).all():
+        raise ValueError("点云含 NaN/Inf，拒绝求解（请先清洗数据）")
+    ext = P.max(0) - P.min(0)
+    if len(P) < 4 or float(np.max(ext)) <= 0:
+        raise ValueError(
+            f"点云退化（N={len(P)}，包围盒边长={np.round(ext, 6).tolist()}）——"
+            f"体素化相场需要至少 4 个不重合、包围盒非退化的点")
     lo, hi = P.min(0) - 1e-6, P.max(0) + 1e-6
     if n_vox is None:
         n_vox, _ = auto_resolution(P, nn_mult, n_vox_max, verbose)
+    # n_vox_max 是 RAM 护栏：96³ = 88 万体素已是 float64 多份数组的合理上限。
+    # 早先版本只在自动路径生效，显式传 n_vox=500 会直接分配 500³ = 1.25 亿
+    # 体素（每份 float64 数组 1GB，平滑/拉普拉斯临时数组翻几倍）→ 内存爆炸。
+    # 护栏必须对显式值同样生效（钳制并提示，不做静默豁免）。
+    n_vox = int(min(int(n_vox), int(n_vox_max)))
+    if verbose and n_vox == int(n_vox_max):
+        print(f"  n_vox 钳制到 RAM 上限 {n_vox_max}")
     occ, h = _voxelize(P, n_vox, lo, hi)
     if verbose:
         print(f"  体素: h={h:.5f}, 占据体素={int(occ.sum())}, "
@@ -324,21 +366,32 @@ def _prep(P, grow=1, smooth=0.5, w=0.4, nn_mult=2.2, n_vox=None,
 # --------------------------------------------------------------------------
 def _run_ac(occ, h, iters, eps, lam, T=None, g=None, R=None, cfl=1.0 / 12.0,
             well=True, track=None):
-    """相场通用推进。occ 不参与演化（只为调用方保留位置），目标由 T 给出。"""
+    """相场通用推进。occ 不参与演化（只为调用方保留位置），目标由 T 给出。
+
+    稳定性判据（显式 Euler，3D 7 点拉普拉斯谱半径 12/h²）：
+        PDE 写成 ε²Δφ 时，扩散稳定要求 dt·ε²·12/h² ≤ 2，即 dt ≤ h²/(6ε²)，
+        等价于这里的 cfl = dt·ε²/h² ≤ 1/6。
+    """
     eps2 = eps * eps
-    # 时间步：带 eps^2 前缀 => dt = cfl*h^2/eps^2；3D 用 6 邻域，故 cfl 上限 1/6
+    # 时间步：带 eps^2 前缀 => dt = cfl*h^2/eps^2
     dt = cfl * h * h / eps2
     cfl_actual = 6.0 * dt * eps2 / (h * h)
     if cfl_actual > 1.0 + 1e-9:
-        raise ValueError(f"CFL={cfl_actual:.2f} > 1，3D 相场需 cfl <= 1/(6*(eps/h)^2)"
-                         f"= {1.0/(6.0*(eps/h)**2):.4f}")
+        raise ValueError(
+            f"时间步超稳定上界：dt={dt:.3g} 需 ≤ h²/(6ε²)={h*h/(6*eps2):.3g}"
+            f"（等价 cfl ≤ 1/6 ≈ {1/6:.4f}，当前 cfl={cfl:.4f}）。"
+            f"可减小 cfl，或增大 eps_h（ε=eps_h·h）。")
     if T is None:
         T = occ.astype(np.float64)
         T = 2.0 * T - 1.0
     phi = T.copy()
     for it in range(iters):
         lap = _laplacian(phi, h)
-        r = -phi * (phi ** 2 - 1.0) / 2.0 if well else 0.0
+        # 标准双阱反应项 -（φ³-φ），与 conserved/aniso/CH/convex 全族一致。
+        # 早先版本这里多除了个 2，导致 pf_ac 族的界面驱动比同族慢一倍且无出处。
+        r = -phi * (phi ** 2 - 1.0) if well else 0.0
+        # barrier 路线：g（边缘指示）与 R（原始占据）同时乘进反应项 ——
+        # 注意这意味着 T>0 但 R=0 的膨胀区保真项被关闭，外部体素只做纯扩散。
         acc = g if g is not None else 1.0
         Rm = R if R is not None else 1.0
         phi = phi + dt * (eps2 * lap + acc * Rm * (r + lam * (T - phi)))
@@ -349,81 +402,110 @@ def _run_ac(occ, h, iters, eps, lam, T=None, g=None, R=None, cfl=1.0 / 12.0,
     return phi, dt, cfl_actual
 
 
+def _phase_field_ac_common(P, N, iters, eps_h, lam, grow, smooth, w, nn_mult,
+                           n_vox, n_vox_max, cfl, verbose):
+    """pf_ac 与 pf_ac_fidelity 的共享实现——两者只差默认 λ，函数体曾逐字
+    重复两份，修 bug 时改了一份漏一份。"""
+    occ, h, T = _prep(P, grow, smooth, w, nn_mult, n_vox, n_vox_max, verbose)
+    phi, dt, c = _run_ac(None, h, iters, eps_h * h, lam, T=T, cfl=cfl)
+    pts = _extract_surface(phi, h, P.min(0) - 1e-6, P, N)
+    return pts, {"dt": dt, "cfl": c, "h": h}
+
+
 def phase_field_ac(P, N, iters=150, eps_h=2.0, lam=0.5, grow=1, smooth=0.5,
                    w=0.4, nn_mult=2.2, n_vox=None, n_vox_max=96,
-                   verbose=False, **kw):
+                   cfl=1.0 / 12.0, verbose=False, **kw):
     """Allen–Cahn + 弱保真项：曲率驱动平滑，靠 λ 抵抗毛细收缩。
 
     ⚠ 纯 AC（λ=0）会**腐蚀**有限大小的正相：它是双阱势能的梯度流，
     有限液滴受毛细压力必然收缩到零测度。所以作为去噪器必须给一点保真项。
-    保留 lam=0 的能力是为了演示这个物理事实（`--lam-g 0`）。
+    保留 lam=0 的能力是为了演示这个物理事实（可在 Python API 里传 lam=0）。
+    cfl（= dt·ε²/h²，须 ≤ 1/6）已暴露为参数，超界会被显式拒绝。
     """
-    occ, h, T = _prep(P, grow, smooth, w, nn_mult, n_vox, n_vox_max, verbose)
-    phi, dt, cfl = _run_ac(None, h, iters, eps_h * h, lam, T=T)
-    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": cfl}
+    return _phase_field_ac_common(P, N, iters, eps_h, lam, grow, smooth, w,
+                                  nn_mult, n_vox, n_vox_max, cfl, verbose)
 
 
 def phase_field_ac_fidelity(P, N, iters=150, eps_h=2.0, lam=0.8, grow=1, smooth=0.5,
                             w=0.4, nn_mult=2.2, n_vox=None,
-                            n_vox_max=96, verbose=False, **kw):
+                            n_vox_max=96, cfl=1.0 / 12.0, verbose=False, **kw):
     """AC + 保真项 λ(T−φ)。ε 与 λ 对抗 accuracy / volume，这是本包的核心基线。"""
-    occ, h, T = _prep(P, grow, smooth, w, nn_mult, n_vox, n_vox_max, verbose)
-    phi, dt, cfl = _run_ac(None, h, iters, eps_h * h, lam, T=T)
-    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": cfl}
+    return _phase_field_ac_common(P, N, iters, eps_h, lam, grow, smooth, w,
+                                  nn_mult, n_vox, n_vox_max, cfl, verbose)
 
 
 def phase_field_ac_barrier(P, N, iters=150, eps_h=2.0, lam=1.0,
                            sigma_h=3.0, alpha=2.0, grow=1, smooth=0.5, w=0.4,
                            nn_mult=2.2, n_vox=None, n_vox_max=96,
-                           verbose=False, **kw):
+                           cfl=1.0 / 12.0, verbose=False, **kw):
     """AC + 边缘指示函数屏障 g = 1/(1+|∇(G_σ*T)|^α)（论文①路线）。
 
     g 在平坦区≈1、边界处≈0，像一堵墙把界面钉在数据附近，
     因此比纯 AC 更能保住「贴合度」，但需要更大 λ 才推动得动。
     """
     occ, h, T = _prep(P, grow, smooth, w, nn_mult, n_vox, n_vox_max, verbose)
-    S = _smooth3(T, sigma_h)
-    g = 1.0 / (1.0 + _grad_mag(S, h) ** alpha)
+    S_ = _smooth3(T, sigma_h)
+    g = 1.0 / (1.0 + _grad_mag(S_, h) ** alpha)
     R = occ.astype(np.float64)
-    phi, dt, cfl = _run_ac(None, h, iters, eps_h * h, lam, T=T, g=g, R=R)
-    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": cfl}
+    phi, dt, c = _run_ac(None, h, iters, eps_h * h, lam, T=T, g=g, R=R, cfl=cfl)
+    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": c, "h": h}
 
 
 def cahn_hilliard(P, N, iters=300, eps_h=2.0, lam=0.8, mob=1.0,
                   grow=1, smooth=0.5, w=0.4, nn_mult=2.2,
-                  n_vox=None, n_vox_max=96, verbose=False, **kw):
+                  n_vox=None, n_vox_max=96, ch_cfl=0.05, verbose=False, **kw):
     """Cahn–Hilliard（守恒型）：体积自动保持，代价是欠平滑。
 
-        dφ/dt = -M ∇²( ε²∇²φ − dV/dφ ) + λ(T − φ)
+        dφ/dt = -M ∇²( ε²∇²φ − dV/dφ ) + λ(T − φ)₀
         V(φ) = (φ²−1)²/4  ⇒  dV/dφ = φ(φ²−1)
 
-    CH 满足 d/dt∫φ = 0，所以「保体积」是格式自带的保证，不依赖调参。
+    ⚠ 保体积的实现要点：保真项必须做**零均值化**（记号 (·)₀ = 减去均值）。
+    早先版本把 λ(T−φ) 裸加在 ∇² 外面，d/dt∫φ = λ∫(T−φ) ≠ 0 ——
+    「保体积是格式级保证」的说法对那份代码在数学上不成立（实测 rDrift
+    非零即旁证）。零均值化后，Neumann 边界的 6 点拉普拉斯通量和恰为零、
+    保真项直流分量又被投影掉，d/dt∫φ = 0 才是**逐格式精确**成立的。
 
     ⚠ 时间步与 AC **不一样**，这是 CH 实现最常见的发散原因：
     化学势 μ 里有 Δφ，于是 μ 外面又套一层 Δ，格式实际含 **四阶**算子
     ε²∇⁴φ。显式格式对它的限制是  Δt·M·ε²·6/h⁴ ≤ 1  ⇒  Δt ≤ h⁴/(6Mε²)，
     比 AC 的 h²/ε² **严格得多**。直接套 AC 的 Δt 会在第 3~5 步就炸掉
-    （实测确实如此）。所以这里单独算，并默认用较保守的系数。
+    （实测确实如此）。ch_cfl 是相对该上界的安全系数（须 ≤ 1），
+    已暴露为参数；实测 0.5 会在第 7 步发散，0.05 才稳定。
+    这也说明为什么组里近年的 CH 论文几乎都改用 BDF2/SAV/ES-SAV 这类
+    隐式或标量辅助变量格式 —— 纯显式 CH 的刚性实在太难压。
     """
     occ, h, T = _prep(P, grow, smooth, w, nn_mult, n_vox, n_vox_max, verbose)
-    eps2 = (eps_h * h) ** 2
+    phi, dt, cfl = _run_ch(occ, h, iters, eps_h * h, lam, mob=mob, T=T,
+                           ch_cfl=ch_cfl)
+    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": cfl, "h": h}
+
+
+def _run_ch(occ, h, iters, eps, lam, mob=1.0, T=None, ch_cfl=0.05):
+    """Cahn–Hilliard 推进：四阶算子显式格式 + 零均值保真项，严格质量守恒。"""
+    eps2 = eps * eps
     # 四阶算子：dt <= h^4 / (6 * mob * eps^2)；再乘安全系数 ch_cfl。
-    # ch_cfl 必须小：实测 0.5 会在第 7 步发散，0.05 才稳定。
-    # 这也说明为什么组里近年的 CH 论文几乎都改用 BDF2/SAV/ES-SAV 这类隐式或
-    # 标量辅助变量格式 —— 纯显式 CH 的刚性实在太难压。
-    ch_cfl = 0.05
-    dt = ch_cfl * h ** 4 / (6.0 * max(mob, 1e-12) * eps2)
-    # 显式报告 CH 的真实扩散数（不是 AC 那个）
+    mob = max(float(mob), 1e-12)
+    dt = ch_cfl * h ** 4 / (6.0 * mob * eps2)
+    # 显式报告 CH 的真实扩散数（不是 AC 那个），超界在开跑前拒绝
     cfl_actual = 6.0 * dt * mob * eps2 / (h ** 4)
+    if cfl_actual > 1.0 + 1e-9:
+        raise ValueError(
+            f"时间步超 CH 稳定上界：dt={dt:.3g} 需 ≤ h⁴/(6Mε²)="
+            f"{h**4/(6*mob*eps2):.3g}（ch_cfl ≤ 1，当前 {ch_cfl:.3f}）")
+    if T is None:
+        T = occ.astype(np.float64)
+        T = 2.0 * T - 1.0
     phi = T.copy()
     for it in range(iters):
         mu = eps2 * _laplacian(phi, h) - phi * (phi ** 2 - 1.0)
         lap_mu = _laplacian(mu, h)
-        phi = phi + dt * (-mob * lap_mu + lam * (T - phi))
+        fidelity = lam * (T - phi)
+        fidelity -= fidelity.mean()          # 零均值化：保住 d/dt∫φ = 0
+        phi = phi + dt * (-mob * lap_mu + fidelity)
         if not np.isfinite(phi).all():
             raise RuntimeError(f"Cahn-Hilliard 第 {it} 步发散："
-                               f"四阶算子对 Δt 极敏感，可减小 eps_h 或增大 n_vox")
-    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": cfl_actual}
+                               f"四阶算子对 Δt 极敏感，可减小 ch_cfl 或 eps_h")
+    return phi, dt, cfl_actual
 
 
 def _run_ac_conserved(occ, h, iters, eps, lam, T=None, cfl=1.0 / 12.0, track=None):
@@ -432,8 +514,9 @@ def _run_ac_conserved(occ, h, iters, eps, lam, T=None, cfl=1.0 / 12.0, track=Non
     dt = cfl * h * h / eps2
     cfl_actual = 6.0 * dt * eps2 / (h * h)
     if cfl_actual > 1.0 + 1e-9:
-        raise ValueError(f"CFL={cfl_actual:.2f} > 1，3D 相场需 cfl <= 1/(6*(eps/h)^2)"
-                         f"= {1.0/(6.0*(eps/h)**2):.4f}")
+        raise ValueError(
+            f"时间步超稳定上界：dt={dt:.3g} 需 ≤ h²/(6ε²)={h*h/(6*eps2):.3g}"
+            f"（等价 cfl ≤ 1/6 ≈ {1/6:.4f}，当前 cfl={cfl:.4f}）")
     if T is None:
         T = occ.astype(np.float64)
         T = 2.0 * T - 1.0
@@ -452,7 +535,7 @@ def _run_ac_conserved(occ, h, iters, eps, lam, T=None, cfl=1.0 / 12.0, track=Non
 
 def phase_field_ac_conserved(P, N, iters=150, eps_h=2.0, lam=0.8, grow=1, smooth=0.5,
                              w=0.4, nn_mult=2.2, n_vox=None, n_vox_max=96,
-                             verbose=False, **kw):
+                             cfl=1.0 / 12.0, verbose=False, **kw):
     r"""拉格朗日乘子全局体积守恒 Allen-Cahn 相场求解器。
 
     增加时间依赖项 beta(t) = mean(phi^3 - phi + lam*(phi - T))，并在更新中补偿 +dt*beta(t)，
@@ -461,8 +544,8 @@ def phase_field_ac_conserved(P, N, iters=150, eps_h=2.0, lam=0.8, grow=1, smooth
     且保持二阶扩散的大时间步稳定性。
     """
     occ, h, T = _prep(P, grow, smooth, w, nn_mult, n_vox, n_vox_max, verbose)
-    phi, dt, cfl = _run_ac_conserved(None, h, iters, eps_h * h, lam, T=T)
-    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": cfl}
+    phi, dt, c = _run_ac_conserved(None, h, iters, eps_h * h, lam, T=T, cfl=cfl)
+    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": c, "h": h}
 
 
 def _run_ac_anisotropic(occ, h, iters, eps, lam, c_tangent=1.0, c_normal=0.1,
@@ -474,8 +557,9 @@ def _run_ac_anisotropic(occ, h, iters, eps, lam, c_tangent=1.0, c_normal=0.1,
     dt = cfl * h * h / (eps2 * max_c)
     cfl_actual = 6.0 * dt * eps2 * max_c / (h * h)
     if cfl_actual > 1.0 + 1e-9:
-        raise ValueError(f"CFL={cfl_actual:.2f} > 1，3D 相场需 cfl <= 1/(6*(eps/h)^2)"
-                         f"= {1.0/(6.0*(eps/h)**2):.4f}")
+        raise ValueError(
+            f"时间步超稳定上界：dt={dt:.3g} 需 ≤ h²/(6ε²·max_c)="
+            f"{h*h/(6*eps2*max_c):.3g}（等价 cfl ≤ 1/6，当前 cfl={cfl:.4f}）")
     if T is None:
         T = occ.astype(np.float64)
         T = 2.0 * T - 1.0
@@ -533,10 +617,10 @@ def phase_field_ac_anisotropic(P, N, iters=150, eps_h=2.0, lam=0.8, c_tangent=1.
     保护尖角与边缘特征免受过度钝化。
     """
     occ, h, T = _prep(P, grow, smooth, w, nn_mult, n_vox, n_vox_max, verbose)
-    phi, dt, cfl = _run_ac_anisotropic(None, h, iters, eps_h * h, lam,
-                                       c_tangent=c_tangent, c_normal=c_normal,
-                                       sigma_n=sigma_n, T=T)
-    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": cfl}
+    phi, dt, c = _run_ac_anisotropic(None, h, iters, eps_h * h, lam,
+                                     c_tangent=c_tangent, c_normal=c_normal,
+                                     sigma_n=sigma_n, T=T)
+    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt, "cfl": c, "h": h}
 
 
 def _run_ac_convex(occ, h, iters, eps, lam, dt=None, T=None, track=None):
@@ -689,8 +773,8 @@ def phase_field_ac_convex(P, N, iters=80, eps_h=2.0, lam=0.8, dt_mult=1.0,
     """
     occ, h, T = _prep(P, grow, smooth, w, nn_mult, n_vox, n_vox_max, verbose)
     dt = dt_mult * 0.4 * h
-    phi, dt_actual, cfl = _run_ac_convex(None, h, iters, eps_h * h, lam, dt=dt, T=T)
-    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt_actual, "cfl": 0.0}
+    phi, dt_actual, c = _run_ac_convex(None, h, iters, eps_h * h, lam, dt=dt, T=T)
+    return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), {"dt": dt_actual, "cfl": 0.0, "h": h}
 
 
 def phase_field_ac_convex_adaptive(P, N, iters=80, eps_h=2.0, lam=0.8, tol=1e-3,
@@ -708,6 +792,7 @@ def phase_field_ac_convex_adaptive(P, N, iters=80, eps_h=2.0, lam=0.8, tol=1e-3,
         None, h, iters=iters, eps=eps_h * h, lam=lam, target_time=target_time,
         tol=tol, dt_init=dt_init, dt_max=dt_max, T=T
     )
+    info["h"] = h
     return _extract_surface(phi, h, P.min(0) - 1e-6, P, N), info
 
 
@@ -736,7 +821,7 @@ DESCRIPTIONS = {
     "pf_ac_aniso": "各向异性张量 AC，切向强平滑、法向抑制扩散保特征，ε=2h, λ=0.8",
     "pf_ac_convex": "半隐式 Eyre 凸分裂 AC，无条件能量耗散稳定，时间步大 20~50 倍",
     "pf_ac_convex_adaptive": "自适应时间步长半隐式 Eyre 凸分裂 AC，基于双步 LTE 与能量耗散控制",
-    "cahn_hilliard": "CH 守恒型，ε=2h, λ=0.8, M=1，ch_cfl=0.05。体积是格式级保证",
+    "cahn_hilliard": "CH 守恒型，ε=2h, λ=0.8, M=1，ch_cfl=0.05，保真项零均值化。体积是格式级保证",
 }
 
 

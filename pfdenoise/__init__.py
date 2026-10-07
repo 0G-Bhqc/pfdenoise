@@ -22,11 +22,13 @@
     print(pfd.make_table(rows))
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 import sys as _sys
 
 # Windows 控制台默认 GBK，打印中文/箭头会 UnicodeEncodeError。
+# 这是本工作区（AGENTS.md 编码契约）刻意要求的导入期副作用：
+# CLI 与脚本统一在包入口完成编码兜底，调用方无需各自处理。
 for _s in (_sys.stdout, _sys.stderr):
     try:
         _s.reconfigure(encoding="utf-8", errors="replace")
@@ -37,13 +39,16 @@ from .shapes import make_shape, SHAPES
 from .noise import (NoiseModel, Gaussian, Protrusion, Outlier, Aniso, Density,
                     Composite, NOISE_MODELS, make_noise)
 from .solvers import (SOLVERS, DESCRIPTIONS, get_solver,
-                    phase_field_ac_conserved, phase_field_ac_anisotropic,
-                    phase_field_ac_convex, phase_field_ac_convex_adaptive)
+                      phase_field_ac, phase_field_ac_fidelity,
+                      phase_field_ac_conserved, phase_field_ac_anisotropic,
+                      phase_field_ac_convex, phase_field_ac_convex_adaptive)
 from . import metrics, solvers, noise, shapes, mesh_io
 from .benchmark import (run_benchmark, run_n2n, run_bias_variance,
                         make_table, make_bv_table, DEFAULT_SOLVERS)
 from .mesh_io import (load_point_cloud, save_point_cloud, normalize_cloud, denoise_file,
                       load_ply, save_ply, load_obj, save_obj, load_mat_volume)
+from . import benchmark
+from . import cli
 
 __all__ = [
     "__version__",
@@ -51,6 +56,7 @@ __all__ = [
     "NoiseModel", "Gaussian", "Protrusion", "Outlier", "Aniso", "Density",
     "Composite", "NOISE_MODELS", "make_noise",
     "SOLVERS", "DESCRIPTIONS", "get_solver",
+    "phase_field_ac", "phase_field_ac_fidelity",
     "phase_field_ac_conserved", "phase_field_ac_anisotropic",
     "phase_field_ac_convex", "phase_field_ac_convex_adaptive",
     "run_benchmark", "run_n2n", "run_bias_variance", "make_table", "make_bv_table",
@@ -58,8 +64,5 @@ __all__ = [
     "load_point_cloud", "save_point_cloud", "normalize_cloud", "denoise_file",
     "load_ply", "save_ply", "load_obj", "save_obj", "load_mat_volume",
     "metrics", "solvers", "noise", "shapes", "mesh_io",
+    "benchmark", "cli",
 ]
-
-# Auto-exposed submodules by PackageIntegrityChecker
-from . import benchmark
-from . import cli

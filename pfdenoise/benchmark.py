@@ -28,10 +28,6 @@ DEFAULT_SOLVERS = [
     "cahn_hilliard"
 ]
 
-# 越小越好的指标
-LOWER_BETTER = {"chamfer", "p2m", "p2m_p95", "hausdorff",
-                "normal_err", "radius_drift", "volume_drift", "thickness",
-                "raw_consistency", "variance", "total_mse"}
 # 相对真值的绝对值，漂移类指标要看 |·|
 ABS_METRICS = {"radius_drift", "volume_drift"}
 
@@ -68,6 +64,7 @@ def run_benchmark(shape="bumpy", n=6000, noise="realistic", seed=0,
         print(f"  bbox 半宽={scale:.3f}\n")
 
     rows = []
+    nn_ref = _NN(P_ref)          # 参考云索引只建一次，整个基准循环复用
     for name in solver_names:
         fn = S.get_solver(name)
         kw = solver_kwargs.get(name, {})
@@ -85,15 +82,21 @@ def run_benchmark(shape="bumpy", n=6000, noise="realistic", seed=0,
                 print(f"  {name:<18} FAILED: {e}")
             continue
         dt_s = time.perf_counter() - t0
-        # 体素化求解器要报分辨率下限：CD/P2M 触到 h/2 就是在测分辨率而非精度
+        # 体素化求解器要报分辨率下限：CD/P2M 触到 h/2 就是在测分辨率而非精度。
+        # 优先用求解器 info 里带回来的实际 h（免去重复的 kNN 探查），
+        # 拿不到（或经典滤波）才回退。
         res_floor = None
-        if name.startswith("pf_") or name == "cahn_hilliard":
+        h_est = info.get("h")
+        if h_est is not None:
+            res_floor = 0.5 * float(h_est)
+        elif name.startswith("pf_") or name == "cahn_hilliard":
             try:
                 _, h = S.auto_resolution(Pn)
                 res_floor = 0.5 * h
             except Exception:                          # noqa: BLE001
                 res_floor = None
-        m = M.evaluate(P_est, P_ref, N_ref, ref_dense=P_dense, res_floor=res_floor)
+        m = M.evaluate(P_est, P_ref, N_ref, ref_dense=P_dense,
+                       res_floor=res_floor, nn_ref=nn_ref)
         m.update(shape=shape, noise=noise, solver=name, seconds=dt_s,
                  n_out=len(P_est))
         if "cfl" in info:
@@ -202,7 +205,13 @@ def run_bias_variance(shape="bumpy", n=3000, noise="realistic", k_runs=3,
         if failed:
             continue
         dt_s = (time.perf_counter() - t0) / k_runs
-        decomp = M.bias_variance_decomposition(preds, ref=P_ref)
+        try:
+            decomp = M.bias_variance_decomposition(preds, ref=P_ref)
+        except ValueError as e:                      # 如 k_runs=1
+            bv_rows.append(dict(solver=name, error=f"{type(e).__name__}: {e}"))
+            if verbose:
+                print(f"  {name:<22} 分解失败：{e}")
+            continue
         row = {
             "solver": name,
             "variance": decomp["variance"],
@@ -229,8 +238,14 @@ COLUMNS = [("solver", "solver", "str"), ("chamfer", "CD↓", "num"),
 
 
 def make_table(rows, fmt="markdown", title=None):
-    """把 rows 变成 markdown 或 csv 文本。"""
+    """把 rows 变成 markdown 或 csv 文本。
+
+    失败行的 `error` 字段不在 COLUMNS 里——早先版本导出 CSV 时把它静默
+    吞掉，失败原因只活在前台 stdout 里。这里凡有失败行就补一列 error。
+    """
     cols = [c for c in COLUMNS if any(c[0] in r for r in rows)]
+    if any("error" in r for r in rows):
+        cols = cols + [("error", "error", "str")]
     if fmt == "csv":
         buf = io.StringIO()
         w = csv.writer(buf)
@@ -272,6 +287,8 @@ BV_COLUMNS = [
 def make_bv_table(rows, fmt="markdown", title=None):
     """把偏差-方差分解结果格式化为 markdown 或 csv 表格。"""
     cols = [c for c in BV_COLUMNS if any(c[0] in r for r in rows)]
+    if any("error" in r for r in rows):
+        cols = cols + [("error", "error", "str")]
     if fmt == "csv":
         buf = io.StringIO()
         w = csv.writer(buf)

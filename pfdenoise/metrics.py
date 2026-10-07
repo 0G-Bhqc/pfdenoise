@@ -3,11 +3,13 @@
 分两类
 ------
 有标签（需要干净真值）:
-    chamfer        单向 Chamfer 距离
+    chamfer        双向 Chamfer 距离
     p2m            Point-to-Mesh 距离（用密集参考点采样代理，见下）
-    hausdorff      单向最大距离，捕捉最坏情况
-    normal_err     法向平均夹角，衡量「特征/结构保持」
-    area_drift     面积/体积相对真值的漂移 —— **经典文献的卖点，DL 论文普遍不报**
+    hausdorff      双向最大距离，捕捉最坏情况
+    normal_err     法向平均夹角（方向不变，见 normal_error 的说明），
+                   衡量「特征/结构保持」
+    volume_drift   凸包体积相对真值的漂移（scipy 可用时）——
+                   **经典文献的卖点，DL 论文普遍不报**；scipy 不可用时退回 radius_drift
     p2m_p95        P2M 的 95 分位，比均值更能反映「大部分点贴住了没有」
 
 无标签（拿不到干净真值时用）:
@@ -20,11 +22,14 @@
 关于 P2M 的诚实说明
 -----------------
 文献里的 Point-to-Mesh 需要真值三角网格的点到三角形距离。本包不引入网格资产，
-而是用**高密度重采样**（默认 8×）作为代理：P2M_proxy = 点到密集参考点云的距离。
+而是用**高密度重采样**（默认 4×，见 run_benchmark 的 dense_mult）作为代理：
+P2M_proxy = 点到密集参考点云的距离。
 它在高密度极限下收敛到真 P2M，但数值会略偏小（网格离散误差的相反方向）。
 所有 baseline 都用同一个代理，所以**方法之间的相对比较是公平的**；
 要报绝对数值时请注明用了代理。
 """
+
+from __future__ import annotations
 
 import numpy as np
 
@@ -97,12 +102,17 @@ def normal_error(P_est, P_ref, N_ref, k=12, nn_ref=None):
 
     这是相场类方法的卖点指标：平滑噪声的同时保住尖锐特征。
     注意它只对**有真值法向**的解析曲面成立；真实扫描需要人工标定法向。
+
+    夹角按**方向不变**计算（取 |n·n| 再 arccos）：k-NN PCA 估计出的法向
+    本来就有符号二义性，「统一朝向」启发式（质心指向外）在 torus 内环
+    这类非星形曲面上会系统性翻转——不取绝对值就会把「法向估计得很好」
+    误判成「误差约 90°」。
     """
     nn_ref = nn_ref or _NN(P_ref)
     _, i = nn_ref.query(np.asarray(P_est, dtype=np.float64), 1)
     n_ref = N_ref[i[:, 0]]
     n_est = estimate_normals(P_est, k=k)
-    d = np.sum(n_est * n_ref, axis=1)
+    d = np.abs(np.sum(n_est * n_ref, axis=1))
     return float(np.degrees(np.arccos(np.clip(d, -1, 1))).mean())
 
 
@@ -183,36 +193,52 @@ def n2n_consistency(A, B, nn=None):
 
 
 def self_consistency(P, fn, n=2, **kw):
-    """固定点距离：连续施加去噪 f，量 ‖f(f(P)) − f(P)‖。
+    """固定点距离：连续施加去噪 f，量 chamfer(f^{n-1}(P), f^n(P))。
 
     相场类模型的不动点性质使这个量有明确含义：
     越小说明迭代越接近不动点（即算法已收敛），否则说明还在「动」。
+    求解器返回 (points, info) 元组时自动取第一个元素——不拆包的话，
+    第二次 fn 调用会直接拿到元组而崩溃。
     """
-    cur = fn(P, **kw)
+    if n < 2:
+        raise ValueError("self_consistency 至少需要 n=2 次施加才能算相邻两次的差异")
+
+    def _pts(x):
+        return x[0] if isinstance(x, tuple) else x
+
+    prev = _pts(fn(P, **kw))
+    d = float("inf")
     for _ in range(n - 1):
-        cur = fn(cur, **kw)
-    return float(chamfer(P, cur))
+        cur = _pts(fn(prev, **kw))
+        d = chamfer(prev, cur)
+        prev = cur
+    return float(d)
 
 
-def evaluate(P_est, P_ref, N_ref, ref_dense=None, res_floor=None):
+def evaluate(P_est, P_ref, N_ref, ref_dense=None, res_floor=None, nn_ref=None):
     """有标签全指标。ref_dense 可选；res_floor 是体素量化下限（若有则标注）。
 
     res_floor 很重要：体素化相场的几何精度被 h/2 卡死，任何小于它的
     CD/P2M 只是在**测分辨率**，不是求解器的真实能力。at_floor 标志就是
     提醒读者「这个数字已经触底了，别再拿来比方法」。
+
+    nn_ref 可传入已建好的 P_ref 索引复用（基准循环里同一参考云要被
+    每行求解器查一遍，重复建索引是纯浪费）；不传则内部自建。
     """
-    nn_ref = _NN(P_ref)
+    nn_ref = nn_ref or _NN(P_ref)
     out = {
         "chamfer": chamfer(P_est, P_ref, nn_ref),
-        "p2m": p2m(P_est, ref_dense if ref_dense is not None else P_ref),
-        "p2m_p95": p2m(P_est, ref_dense if ref_dense is not None else P_ref, pct=95),
+        "p2m": p2m(P_est, ref_dense if ref_dense is not None else P_ref, nn=nn_ref),
+        "p2m_p95": p2m(P_est, ref_dense if ref_dense is not None else P_ref,
+                       nn=nn_ref, pct=95),
         "hausdorff": hausdorff(P_est, P_ref),
         "normal_err": normal_error(P_est, P_ref, N_ref, nn_ref=nn_ref),
         "radius_drift": radius_drift(P_est, P_ref),
         "volume_drift": volume_drift(P_est, P_ref),
         "thickness": thickness(P_est, P_ref, nn=nn_ref),
     }
-    if res_floor:
+    # is not None 而不是真值判断：res_floor=0.0 是合法的退化下限，不能被跳过
+    if res_floor is not None:
         out["res_floor"] = res_floor
         out["at_floor"] = bool(out["chamfer"] <= 1.5 * res_floor)
     return out

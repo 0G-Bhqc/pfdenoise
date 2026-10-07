@@ -1,6 +1,6 @@
 # pfdenoise 设计文档
 
-> 状态：v0.1.0 已实现并通过 22 个测试
+> 状态：v0.1.1 已实现并通过 101 个测试（2026-10 正确性专项回归后）
 > 本文档说明**为什么这样设计**、每个接口的契约、以及下一步做什么。
 
 ---
@@ -258,21 +258,21 @@ RuntimeError: 相场正相塌缩（phi>0 只有 0 个体素，phi 范围 [-1.000
 ### P0 — 补齐已知洞（工作量小、收益直接）
 | # | 任务 | 验收 |
 |---|---|---|
-| P0-1 | 把 `thickness` / `self_consistency` / `evaluate_n2n` 纳入测试并接入主表 | 3 个新测试；`run --extra-metrics` |
-| P0-2 | 补 `Density` 噪声的端到端路径（点级 N2N 配对不可用，需要按曲面配对） | 一个可跑的 demo |
+| ~~P0-1~~ ✅ | 把 `thickness` / `self_consistency` / `evaluate_n2n` 纳入测试并接入主表 | `self_consistency` 已修（元组拆包 + 相邻迭代距离）、`evaluate_n2n` 有测试 |
+| ~~P0-2~~ ✅ | 补 `Density` 噪声的端到端路径 | 已注册进 `NOISE_MODELS`，声明改为「只丢点」 |
 | P0-3 | 公开 API 的 `__all__` 与 README 示例逐条对齐 | 文档测试 |
 
 ### P1 — 接入真实数据（让包从「演示」变成「可用」）
 | # | 任务 | 验收 |
 |---|---|---|
 | P1-1 | `.ply/.obj` loader + 法向标注流程 | 能跑 Stanford bunny / RueMadame |
-| P1-2 | 接 `scipy.spatial.ConvexHull` 做真体积，`radius_drift` 升级为 `volume_drift` | 两个指标的对照表 |
+| ~~P1-2~~ ✅ | 接 `scipy.spatial.ConvexHull` 做真体积，`radius_drift` 升级为 `volume_drift` | `metrics.volume_drift` 已实现（scipy 缺席时退回 radius_drift） |
 | P1-3 | 真正的点到三角形 P2M（`trimesh.proximity`） | 与代理版的相关性分析 |
 
 ### P2 — 把无标签协议做实（研究价值最高）
 | # | 任务 | 验收 |
 |---|---|---|
-| P2-1 | 多次（≥3）独立观测的**偏差/方差分解** | 能区分「有偏」与「高方差」的求解器 |
+| ~~P2-1~~ ✅ | 多次（≥3）独立观测的**偏差/方差分解** | `run_bias_variance` / `make_bv_table` / `bv` 子命令已落地 |
 | P2-2 | 异方差噪声下的 N2N 变体 | 给出偏差估计而非一致性 |
 | P2-3 | 与学习式基线的对接接口（不实现模型，只定义输入输出） | 能把 DMESH/PointCleanNet 的输出喂进同一指标表 |
 
@@ -320,3 +320,5 @@ RuntimeError: 相场正相塌缩（phi>0 只有 0 个体素，phi 范围 [-1.000
 | 0.1.0 | 首个可运行版本。4 个噪声族 + 6 个噪声预设、7 个求解器、13 个指标、两个协议、22 个测试 |
 | — | 修复：`_NN` 邻域偏移、`hausdorff` 双向索引、拉普拉斯自邻域、亚格点修正量纲、`dt` 量纲与 CH 四阶刚性 |
 | — | 设计：`auto_resolution` 从点间距自动定 h；`res_floor`/`at_floor` 必报；塌缩改为抛错 |
+| 0.1.1 | 正确性专项（2026-10）：`_NN` 全向量化 + 扩环**精确** k 近邻（与暴力法交叉验证入测试）；torus/superquadric 拒绝采样死循环修复（`make_shape` 曾概率性挂死）；superquadric 法向符号修复；`normal_err` 改方向不变（|n·n|）；Protrusion 净外推方向修复（原先 80% 向内）；Aniso 低频场空操作修复（真空间相关）；CH 保真项零均值化（`∂∫φ/∂t=0` 逐格式精确成立）；`_run_ac` 反应项 /2 系数与全族统一；CFL 报错区分 dt/cfl 上界并暴露 `cfl`/`ch_cfl` 参数；体素化改按最长轴定 h（扁平包围盒不再压扁）；`_extract_surface` 补点改亚格点抖动、下采样改随机消除扫描序偏差；`laplacian` 每轮重建索引；`bilateral` 死参数 `r` 如实化；3.9 兼容（`from __future__ import annotations`）；测试 22 → 72 |
+| 0.1.1 | 二轮迭代：性能与极端测试（2026-10）。**性能（实测）**：`_NN` 合并排序改单键稳定 argsort，查询 6000 点 k=2 由 819ms→268ms（3.1×）、20000 点 4776ms→1344ms（3.6×）、laplacian 十轮主开销 8.2s→2.7s；基准循环复用参考云索引 + 求解器 info 直报 `h`（免去每行重复 kNN 探查）。**极端测试暴露并修复**：查询点含 NaN/Inf 时 floor→int64 铸型变 INT64_MIN、扩环上界被撑到 9e18 实质挂死（现入口拒绝 + 扩环钳制 + 远距查询暴力兜底）；显式 `n_vox` 绕过 `n_vox_max` RAM 护栏（500³ 体素分配挂死，现一律钳制）；`_prep` 对退化点云（<4 点 / 零包围盒）报可读错误。**判定器加固（fieldmate）**：`_cmp` 非数值指标 → 可读 UNTESTED 而非 traceback；预注册 load 前向兼容未知字段；counterexamples 条目形状宽容。**打磨**：pf_ac/fidelity 共享实现；`__all__` 补全 + 导出 `phase_field_ac`/`phase_field_ac_fidelity`；版本号 0.1.1；失败行的 error 原因进表格导出；死代码清理（LOWER_BETTER）；mesh_io docstring 更名。测试 72 → 101（pfdenoise），fieldmate 新增极端测试 11 项 |

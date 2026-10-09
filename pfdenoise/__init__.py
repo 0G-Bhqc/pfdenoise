@@ -41,7 +41,8 @@ from .noise import (NoiseModel, Gaussian, Protrusion, Outlier, Aniso, Density,
 from .solvers import (SOLVERS, DESCRIPTIONS, get_solver,
                       phase_field_ac, phase_field_ac_fidelity,
                       phase_field_ac_conserved, phase_field_ac_anisotropic,
-                      phase_field_ac_convex, phase_field_ac_convex_adaptive)
+                      phase_field_ac_convex, phase_field_ac_convex_adaptive,
+                      project_to_zero_level)
 from . import metrics, solvers, noise, shapes, mesh_io
 from .benchmark import (run_benchmark, run_n2n, run_bias_variance,
                         make_table, make_bv_table, DEFAULT_SOLVERS)
@@ -59,6 +60,7 @@ __all__ = [
     "phase_field_ac", "phase_field_ac_fidelity",
     "phase_field_ac_conserved", "phase_field_ac_anisotropic",
     "phase_field_ac_convex", "phase_field_ac_convex_adaptive",
+    "project_to_zero_level",
     "run_benchmark", "run_n2n", "run_bias_variance", "make_table", "make_bv_table",
     "DEFAULT_SOLVERS",
     "load_point_cloud", "save_point_cloud", "normalize_cloud", "denoise_file",

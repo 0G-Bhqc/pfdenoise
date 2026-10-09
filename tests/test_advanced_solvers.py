@@ -9,22 +9,19 @@ r"""test_advanced_solvers.py — 针对体积守恒与各向异性相场求解�
 """
 
 import numpy as np
-import pytest
 
 import pfdenoise as pfd
 from pfdenoise.solvers import (
-    SOLVERS,
     DESCRIPTIONS,
+    SOLVERS,
+    _prep,
+    _run_ac_anisotropic,
+    _run_ac_conserved,
     get_solver,
-    phase_field_ac_conserved,
     phase_field_ac_anisotropic,
+    phase_field_ac_conserved,
     phase_field_ac_convex,
     phase_field_ac_convex_adaptive,
-    _run_ac_conserved,
-    _run_ac_anisotropic,
-    _run_ac_convex,
-    _run_ac_convex_adaptive,
-    _prep,
 )
 
 
@@ -177,7 +174,9 @@ def test_convex_ac_energy_dissipation():
         return float(e_grad + e_pot + e_fid)
 
     e_init = compute_energy(T)
-    phi_end, _, _ = pfd.solvers._run_ac_convex(None, h, iters=30, eps=eps, lam=lam, dt=0.05, T=T)
+    phi_end, _, _ = pfd.solvers._run_ac_convex(
+        None, h, iters=30, eps=eps, lam=lam, dt=0.05, T=T
+    )
     e_end = compute_energy(phi_end)
 
     assert e_end <= e_init + 1e-4, f"能量非递增违反: E_init={e_init:.4f}, E_end={e_end:.4f}"
@@ -246,7 +245,9 @@ def test_new_solvers_in_benchmark():
         shape="sphere",
         n=1000,
         noise="gaussian",
-        solver_names=["pf_ac_conserved", "pf_ac_aniso", "pf_ac_convex", "pf_ac_convex_adaptive"],
+        solver_names=[
+            "pf_ac_conserved", "pf_ac_aniso", "pf_ac_convex", "pf_ac_convex_adaptive"
+        ],
         solver_kwargs={"pf_ac_conserved": {"iters": 40, "n_vox_max": 24},
                        "pf_ac_aniso": {"iters": 40, "n_vox_max": 24},
                        "pf_ac_convex": {"iters": 30, "n_vox_max": 24},
@@ -268,7 +269,9 @@ def test_new_solvers_in_n2n_protocol():
         shape="sphere",
         n=1000,
         noise="gaussian",
-        solver_names=["pf_ac_conserved", "pf_ac_aniso", "pf_ac_convex", "pf_ac_convex_adaptive"],
+        solver_names=[
+            "pf_ac_conserved", "pf_ac_aniso", "pf_ac_convex", "pf_ac_convex_adaptive"
+        ],
         solver_kwargs={"pf_ac_conserved": {"iters": 30, "n_vox_max": 24},
                        "pf_ac_aniso": {"iters": 30, "n_vox_max": 24},
                        "pf_ac_convex": {"iters": 25, "n_vox_max": 24},
@@ -279,4 +282,57 @@ def test_new_solvers_in_n2n_protocol():
     for r in rows:
         assert "error" not in r
         assert np.isfinite(r["consistency"])
+
+
+# ---------------------------------------------------------------- 零等值面投影
+def test_project_to_zero_level():
+    """验证高阶零等值面正交投影（Level-Set Newton 投影）的数学收敛性与鲁棒性。"""
+    from pfdenoise.solvers import (
+        _extract_surface,
+        _trilinear_interp,
+        project_to_zero_level,
+    )
+
+    # 1. 空点云边界条件
+    empty = project_to_zero_level(np.empty((0, 3)), np.zeros((10, 10, 10)), 0.1, np.zeros(3))
+    assert len(empty) == 0
+
+    # 2. 构造解析球体相场 phi = tanh((R - r) / (sqrt(2)*eps))
+    n_vox = 32
+    h = 2.4 / n_vox
+    lo = np.array([-1.2, -1.2, -1.2])
+    coords_1d = lo[0] + (np.arange(n_vox) + 0.5) * h
+    X, Y, Z = np.meshgrid(coords_1d, coords_1d, coords_1d, indexing="ij")
+    R = 0.8
+    r = np.sqrt(X ** 2 + Y ** 2 + Z ** 2)
+    eps = 2.0 * h
+    phi = np.tanh((R - r) / (np.sqrt(2.0) * eps))
+
+    # 3. 构造偏离 R=0.8 的测试点集（偏离 +0.05）
+    rng = np.random.default_rng(42)
+    dirs = rng.normal(size=(50, 3))
+    dirs /= np.linalg.norm(dirs, axis=1, keepdims=True)
+    pts_perturbed = dirs * (R + 0.05)
+
+    phi_before = _trilinear_interp(phi, h, lo, pts_perturbed)
+    # 投影前点不在零等值面上，phi 有显著非零值
+    assert np.all(np.abs(phi_before) > 0.05)
+
+    # 4. 执行投影
+    pts_proj = project_to_zero_level(pts_perturbed, phi, h, lo, max_iter=2)
+    phi_after = _trilinear_interp(phi, h, lo, pts_proj)
+
+    # 投影后 phi 绝对值显著下降，向零等值面严格收敛
+    assert np.mean(np.abs(phi_after)) < np.mean(np.abs(phi_before)) * 0.3
+    # 半径误差显著减小
+    r_err_before = np.mean(np.abs(np.linalg.norm(pts_perturbed, axis=1) - R))
+    r_err_after = np.mean(np.abs(np.linalg.norm(pts_proj, axis=1) - R))
+    assert r_err_after < r_err_before
+
+    # 5. 测试 _extract_surface 在开启 project_grad=True 时的鲁棒性
+    P, N, _ = _make_cloud(n=300, shape="sphere")
+    extracted = _extract_surface(phi, h, lo, P, N, project_grad=True)
+    assert len(extracted) == len(P)
+    assert np.isfinite(extracted).all()
+
 

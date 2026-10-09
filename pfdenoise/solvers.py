@@ -34,7 +34,7 @@ __all__ = ["SOLVERS", "get_solver", "identity", "laplacian", "bilateral",
            "phase_field_ac", "phase_field_ac_fidelity", "phase_field_ac_barrier",
            "phase_field_ac_conserved", "phase_field_ac_anisotropic",
            "phase_field_ac_convex", "phase_field_ac_convex_adaptive",
-           "cahn_hilliard", "_run_ch"]
+           "cahn_hilliard", "_run_ch", "project_to_zero_level"]
 
 
 # --------------------------------------------------------------------------
@@ -91,12 +91,107 @@ def _smooth3(u, sigma_cells, passes=2):
     return out
 
 
-def _extract_surface(phi, h, lo, P, N, min_frac=0.05):
+def _trilinear_interp(V, h, lo, pts):
+    """三线性插值：评估 3D 标量场 V 在连续坐标点 pts 处的值。"""
+    coords = (pts - lo) / h - 0.5
+    nx, ny, nz = V.shape
+    coords = np.clip(coords, 0.0, [nx - 1.0001, ny - 1.0001, nz - 1.0001])
+    i0 = np.floor(coords).astype(np.int64)
+    i1 = np.minimum(i0 + 1, [nx - 1, ny - 1, nz - 1])
+    d = coords - i0
+
+    c000 = V[i0[:, 0], i0[:, 1], i0[:, 2]]
+    c100 = V[i1[:, 0], i0[:, 1], i0[:, 2]]
+    c010 = V[i0[:, 0], i1[:, 1], i0[:, 2]]
+    c110 = V[i1[:, 0], i1[:, 1], i0[:, 2]]
+    c001 = V[i0[:, 0], i0[:, 1], i1[:, 2]]
+    c101 = V[i1[:, 0], i0[:, 1], i1[:, 2]]
+    c011 = V[i0[:, 0], i1[:, 1], i1[:, 2]]
+    c111 = V[i1[:, 0], i1[:, 1], i1[:, 2]]
+
+    c00 = c000 * (1.0 - d[:, 0]) + c100 * d[:, 0]
+    c01 = c001 * (1.0 - d[:, 0]) + c101 * d[:, 0]
+    c10 = c010 * (1.0 - d[:, 0]) + c110 * d[:, 0]
+    c11 = c011 * (1.0 - d[:, 0]) + c111 * d[:, 0]
+
+    c0 = c00 * (1.0 - d[:, 1]) + c10 * d[:, 1]
+    c1 = c01 * (1.0 - d[:, 1]) + c11 * d[:, 1]
+
+    return c0 * (1.0 - d[:, 2]) + c1 * d[:, 2]
+
+
+def project_to_zero_level(pts, phi, h, lo, max_iter=2, step_scale=1.0, max_step_h=1.0):
+    r"""高阶零等值面正交投影（Level-Set Newton 投影）。
+
+    将体素中心抽样的初始点集 pts 沿局部相场梯度 \nabla\phi 投影至
+    真实的零等值面 {x | \phi(x) = 0}。
+    在相场弥散界面区域，\phi(x) 呈双曲正切过渡，一阶牛顿-拉夫逊修正步：
+        \Delta x = - \frac{\phi(x)}{\|\nabla\phi(x)\|^2} \nabla\phi(x)
+    将体素级离散采样误差由 O(h) 降阶至 O(h^2)，消除阶梯状体素量化走样。
+
+    参数
+    ----
+    pts : (N, 3) ndarray
+        待投影点云（世界坐标系）。
+    phi : (nx, ny, nz) ndarray
+        相场阵列。
+    h : float
+        网格空间步长。
+    lo : (3,) ndarray
+        网格原点。
+    max_iter : int
+        牛顿迭代步数，默认 2 次。
+    step_scale : float
+        步长松弛系数，默认 1.0。
+    max_step_h : float
+        单步位移上限（以 h 为单位），默认 1.0。
+
+    返回
+    ----
+    projected_pts : (N, 3) ndarray
+        投影后的表面点云。
+    """
+    if len(pts) == 0:
+        return pts.copy()
+
+    cur_pts = pts.copy()
+    gx = np.gradient(phi, h, axis=0)
+    gy = np.gradient(phi, h, axis=1)
+    gz = np.gradient(phi, h, axis=2)
+
+    for _ in range(max_iter):
+        val = _trilinear_interp(phi, h, lo, cur_pts)
+        val_x = _trilinear_interp(gx, h, lo, cur_pts)
+        val_y = _trilinear_interp(gy, h, lo, cur_pts)
+        val_z = _trilinear_interp(gz, h, lo, cur_pts)
+        grad = np.column_stack([val_x, val_y, val_z])
+
+        norm2 = np.sum(grad ** 2, axis=1, keepdims=True)
+        valid = (norm2.ravel() > 1e-8)
+        if not np.any(valid):
+            break
+
+        step = np.zeros_like(cur_pts)
+        denom = np.maximum(norm2[valid], 1e-8)
+        delta = - (val[valid, None] / denom) * grad[valid] * float(step_scale)
+
+        delta_len = np.linalg.norm(delta, axis=1, keepdims=True)
+        max_d = float(max_step_h * h)
+        scale = np.minimum(1.0, max_d / np.maximum(delta_len, 1e-12))
+        step[valid] = delta * scale
+
+        cur_pts += step
+
+    return cur_pts
+
+
+def _extract_surface(phi, h, lo, P, N, min_frac=0.05, project_grad=False):
     """把相场 φ 提取回点集。
 
     做法：取 φ>0 的体素中心，做一次沿 φ 的亚格点重心修正（等值面在格子里的
     重心比格心更准），再把点数重采样回输入规模，这样 Chamfer 类指标才与
-    其它方法可比。
+    其它方法可比。若开启 project_grad=True，则额外调用 project_to_zero_level
+    沿局部相场梯度做高阶牛顿投影。
 
     安全阀：如果 φ>0 只剩不到 min_frac 的目标体素，说明相塌缩了（通常是
     体素过粗或 CFL 超限）。这里**直接报错**而不是静默返回输入点——
@@ -143,6 +238,10 @@ def _extract_surface(phi, h, lo, P, N, min_frac=0.05):
         pick = rng.integers(0, len(pts), need)
         extra = pts[pick] + rng.normal(0.0, 0.25 * h, (need, 3))
         pts = np.vstack([pts, extra])
+
+    if project_grad:
+        pts = project_to_zero_level(pts, phi, h, lo)
+
     return pts
 
 
